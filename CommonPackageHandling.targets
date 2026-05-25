@@ -1,0 +1,33 @@
+<Project>
+	<Import Project="$(SolutionDir)LzRunnerVersion.props" />
+
+	<!-- Common properties for package handling. Trimmed copy of the Lz repo's
+	     CommonPackageHandling.targets — only what Lz.Runner needs.  The
+	     DeleteSpecificPackage target (which scrubs the NuGet global cache)
+	     isn't useful here because the runner is consumed via `dotnet tool
+	     install`, not as a NuGet PackageReference, so the global cache never
+	     holds it. -->
+	<PropertyGroup>
+		<PackageRepoFolder>$(SolutionDir)Packages</PackageRepoFolder>
+		<Version>$(LzRunnerVersion)</Version>
+		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+	</PropertyGroup>
+
+	<!-- Create Packages directory before build -->
+	<Target Name="CreateDirectories" BeforeTargets="Build">
+		<MakeDir Directories="$(PackageRepoFolder)"/>
+	</Target>
+
+	<!-- Copy Package to local feed -->
+	<Target Name="CopyPackage" AfterTargets="Pack">
+		<Message Importance="high" Text="Copying $(AssemblyName).$(Version).nupkg to Packages folder" />
+		<MakeDir Directories="$(PackageRepoFolder)" />
+		<Copy SourceFiles=".\bin\$(Configuration)\$(AssemblyName).$(Version).nupkg"
+			  DestinationFiles="$(PackageRepoFolder)\$(AssemblyName).$(Version).nupkg" />
+		<Copy Condition="Exists('.\bin\$(Configuration)\$(AssemblyName).$(Version).snupkg')"
+			  SourceFiles=".\bin\$(Configuration)\$(AssemblyName).$(Version).snupkg"
+			  DestinationFiles="$(PackageRepoFolder)\$(AssemblyName).$(Version).snupkg" />
+	</Target>
+</Project>

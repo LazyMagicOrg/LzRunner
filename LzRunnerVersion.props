@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <!--
+      Version of the Lz.Runner dispatcher, NOT of the Lz infrastructure
+      logic it dispatches to. Bump this only when the resolver algorithm,
+      the entry-point contract with Lz.Cli, or the env-var protocol
+      changes — i.e. very rarely.
+
+      The infrastructure logic (Lz.Cli + Lz.Aws + Lz.Azure + Lz.Core +
+      Lz.Gen) has its own LzVersion.props in the Lz repo and moves on
+      its own cadence.
+    -->
+    <LzRunnerVersion>1.0.0</LzRunnerVersion>
+  </PropertyGroup>
+</Project>

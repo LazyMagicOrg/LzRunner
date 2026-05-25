@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="$(SolutionDir)CommonPackageHandling.targets" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Lz.Runner</RootNamespace>
+
+    <!-- Global tool packaging. Owns the `lz` command. When installed, it
+         loads the highest-versioned Lz.Cli.*.nupkg it can find via the
+         NuGet.Config walk for the current directory, extracts it to
+         %LOCALAPPDATA%\lz-runner\cache\<version>\, and invokes
+         `dotnet <extracted-Lz.Cli.dll> <args>`. -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>lz</ToolCommandName>
+    <PackageId>Lz.Runner</PackageId>
+    <Version>$(LzRunnerVersion)</Version>
+    <Description>Lz dispatcher — resolves the correct Lz.Cli version from the in-scope NuGet.Config and invokes it. Installs as `lz`.</Description>
+  </PropertyGroup>
+
+  <!-- No AssemblyMetadata for BuildOriginPackages or DefaultCliVersion.
+       After the LzRunner/Lz repo split, the runner has no inherent
+       knowledge of where Lz.Cli lives or what version exists. If the
+       NuGet.Config walk doesn't lead to an Lz.Cli.*.nupkg, the runner
+       errors out (see Program.cs). -->
+
+</Project>
