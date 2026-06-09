@@ -2,3 +2,5 @@ bin/
 obj/
 *.user
 .vs/
+# Built nupkgs land here via GeneratePackageOnBuild - build artifacts, not source.
+Packages/

@@ -10,6 +10,6 @@
       Lz.Gen) has its own LzVersion.props in the Lz repo and moves on
       its own cadence.
     -->
-    <LzRunnerVersion>1.0.0</LzRunnerVersion>
+    <LzRunnerVersion>1.1.0</LzRunnerVersion>
   </PropertyGroup>
 </Project>

@@ -13,25 +13,39 @@ namespace Lz.Runner;
 /// source for the newest <c>Lz.Cli.*.nupkg</c>. Extract once into a per-version
 /// cache, then forward the process.
 ///
-/// When no <c>NuGet.Config</c> is in scope we fall back to the build-origin
-/// feed + version that were baked into this assembly at build time — i.e. the
-/// <c>_lz/Packages</c> this runner was installed from, at the version it was
-/// installed as. That makes "just run <c>lz</c> from a random directory"
-/// behave the way a user who installed it expects.
+/// If the resolved chain doesn't lead to a local feed containing an
+/// <c>Lz.Cli.*.nupkg</c>, the runner emits a clear error and exits non-zero.
+/// There is no baked-in fallback — <c>lz</c> is a tool, not a script that runs
+/// "from any directory"; refusing to run beats silently dispatching to stale
+/// logic. See <c>Platform/LzRunnerSplit.md</c> in the Monro repo for design
+/// rationale.
+///
+/// Entry-point contract with Lz.Cli: before spawning dotnet, the runner sets
+/// three environment variables that the Lz.Cli <c>--version</c> handler reads:
+///   <c>LZ_RUNNER_VERSION</c>     — this runner's version (e.g. "1.0.0")
+///   <c>LZ_RUNNER_NUPKG_PATH</c>  — absolute path to the resolved nupkg
+///   <c>LZ_RUNNER_FEED</c>        — the local feed directory that nupkg came from
+/// Keep this contract stable across Lz.Cli releases.
 /// </summary>
 internal static class Program
 {
     private const string CachePrefix = "lz-runner";
     private const string VerboseEnv  = "LZ_RUNNER_VERBOSE";
 
+    // Env-var names passed to the spawned Lz.Cli process so its --version
+    // handler can report 3-line output (runner + cli + plugin).
+    private const string EnvRunnerVersion = "LZ_RUNNER_VERSION";
+    private const string EnvNupkgPath     = "LZ_RUNNER_NUPKG_PATH";
+    private const string EnvFeed          = "LZ_RUNNER_FEED";
+
     private static int Main(string[] args)
     {
         try
         {
-            var (nupkgPath, feedDescription, cliVersion) = ResolveCliPackage();
+            var (nupkgPath, feedDescription, feedDir, cliVersion) = ResolveCliPackage();
             Verbose($"resolved {cliVersion} from {feedDescription}");
             var dllPath = EnsureExtracted(nupkgPath, cliVersion);
-            return InvokeDll(dllPath, args);
+            return InvokeDll(dllPath, args, nupkgPath, feedDir);
         }
         catch (LzRunnerException ex)
         {
@@ -52,7 +66,8 @@ internal static class Program
     /// <summary>
     /// Find the Lz.Cli nupkg that should serve the current invocation and
     /// return its full path plus a human-readable description of which feed
-    /// it came from (for verbose output) plus the parsed version.
+    /// it came from (for verbose output), the feed directory itself (for
+    /// passing through to Lz.Cli's --version handler), and the parsed version.
     ///
     /// Honours NuGet's own config-aggregation rules: walk machine-level,
     /// user-level, then every <c>NuGet.Config</c> from drive root down to
@@ -60,60 +75,34 @@ internal static class Program
     /// <c>&lt;clear/&gt;</c> / <c>&lt;remove/&gt;</c> / disabled sources
     /// respected). Each local source resolves relative to the config that
     /// declared it.
+    ///
+    /// If no in-scope feed contains an <c>Lz.Cli.*.nupkg</c>, throws
+    /// <see cref="LzRunnerException"/> with a clear message — there is no
+    /// baked-in fallback (intentional; see class doc).
     /// </summary>
-    private static (string NupkgPath, string FeedDescription, Version CliVersion) ResolveCliPackage()
+    private static (string NupkgPath, string FeedDescription, string FeedDir, Version CliVersion) ResolveCliPackage()
     {
         var (configs, localFeeds) = ResolveEffectiveLocalFeeds(Directory.GetCurrentDirectory());
 
-        if (configs.Count > 0)
-        {
-            Verbose($"effective NuGet.Config chain ({configs.Count}): {string.Join(" | ", configs)}");
-            Verbose($"effective local feeds ({localFeeds.Count}): {string.Join(" | ", localFeeds)}");
+        Verbose($"effective NuGet.Config chain ({configs.Count}): {string.Join(" | ", configs)}");
+        Verbose($"effective local feeds ({localFeeds.Count}): {string.Join(" | ", localFeeds)}");
 
-            var pick = PickNewestLzCliAcross(localFeeds);
-            if (pick != null)
-                return (pick.Value.Path, pick.Value.Feed, pick.Value.Version);
+        var pick = PickNewestLzCliAcross(localFeeds);
+        if (pick != null)
+            return (pick.Value.Path, pick.Value.Feed, pick.Value.Feed, pick.Value.Version);
 
-            Verbose($"no Lz.Cli.*.nupkg found in any effective local feed — using build-origin default");
-        }
-        else
-        {
-            Verbose("no NuGet.Config found in ancestry, user-level, or machine-level — using build-origin default");
-        }
+        // No baked-in fallback — fail loudly. Tell the user exactly what to fix
+        // and how to see what the runner tried.
+        var detail = localFeeds.Count == 0
+            ? "no local NuGet feeds in scope"
+            : $"no Lz.Cli.*.nupkg in any of {localFeeds.Count} in-scope local feed(s)";
 
-        return FallBackToBuildOrigin();
-    }
-
-    /// <summary>
-    /// Fall back to the feed + version baked into this assembly at build time.
-    /// Prefer the exact runner-version match; drop to "newest in origin" if
-    /// that exact file isn't there (useful after a local rebuild bumped the
-    /// version but the runner hasn't been re-installed).
-    /// </summary>
-    private static (string NupkgPath, string FeedDescription, Version CliVersion) FallBackToBuildOrigin()
-    {
-        var originFeed = GetAssemblyMetadata("Lz.Runner.BuildOriginPackages");
-        var defaultVersion = GetAssemblyMetadata("Lz.Runner.DefaultCliVersion");
-
-        if (string.IsNullOrWhiteSpace(originFeed) || !Directory.Exists(originFeed))
-            throw new LzRunnerException(
-                "no NuGet.Config found in ancestry and build-origin feed is missing " +
-                $"(baked path: '{originFeed ?? "<none>"}'). Reinstall Lz.Runner from an accessible _lz/Packages.");
-
-        // Prefer Lz.Cli.<DefaultCliVersion>.nupkg if present.
-        if (!string.IsNullOrWhiteSpace(defaultVersion))
-        {
-            var exact = Path.Combine(originFeed, $"Lz.Cli.{defaultVersion}.nupkg");
-            if (File.Exists(exact) && Version.TryParse(defaultVersion, out var v))
-                return (exact, $"{originFeed} (build-origin default)", v);
-        }
-
-        // Otherwise take the newest Lz.Cli.*.nupkg in the origin feed.
-        var newest = PickNewestLzCliAcross(new[] { originFeed })
-            ?? throw new LzRunnerException(
-                $"no Lz.Cli.*.nupkg found at build-origin feed '{originFeed}'.");
-
-        return (newest.Path, $"{originFeed} (build-origin, newest)", newest.Version);
+        throw new LzRunnerException(
+            $"{detail} for current directory '{Directory.GetCurrentDirectory()}'." + Environment.NewLine + Environment.NewLine +
+            "  Configure a feed in a NuGet.Config file (machine-wide, user-level, or" + Environment.NewLine +
+            "  walking up from cwd) that contains the Lz packages, or cd into a tenant" + Environment.NewLine +
+            "  repo that has them." + Environment.NewLine + Environment.NewLine +
+            "  Run with LZ_RUNNER_VERBOSE=1 to see which configs and feeds were tried.");
     }
 
     /// <summary>
@@ -325,14 +314,26 @@ internal static class Program
     /// Ensure the nupkg is extracted to the per-version cache, then return
     /// the path to Lz.Cli.dll. Extraction is idempotent; subsequent calls
     /// against the same version skip the unpack.
+    ///
+    /// The Lz.Cli package layout is <c>tools/&lt;tfm&gt;/any/Lz.Cli.dll</c>
+    /// where &lt;tfm&gt; is whatever TargetFramework Lz.Cli was packed for
+    /// (net9.0, net10.0, etc.). We discover the TFM dynamically rather than
+    /// hard-coding it so the runner survives Lz.Cli moving to newer .NET
+    /// versions without itself needing to be re-released. Prefers the
+    /// highest-numbered TFM directory when more than one exists (which
+    /// shouldn't happen for a tool package, but defensive).
     /// </summary>
     private static string EnsureExtracted(string nupkgPath, Version version)
     {
         var cacheRoot = GetCacheRoot();
         var cacheDir = Path.Combine(cacheRoot, version.ToString());
-        var dllPath = Path.Combine(cacheDir, "tools", "net9.0", "any", "Lz.Cli.dll");
 
-        if (File.Exists(dllPath)) return dllPath;
+        // Fast path: already extracted, just locate the dll.
+        if (Directory.Exists(cacheDir))
+        {
+            var cached = FindCliDll(cacheDir);
+            if (cached != null) return cached;
+        }
 
         Directory.CreateDirectory(cacheDir);
         try
@@ -345,11 +346,41 @@ internal static class Program
                 $"failed to extract {nupkgPath} into {cacheDir}: {ex.Message}");
         }
 
-        if (!File.Exists(dllPath))
+        var dllPath = FindCliDll(cacheDir);
+        if (dllPath == null)
             throw new LzRunnerException(
-                $"extracted package at {cacheDir} did not contain the expected {dllPath}.");
+                $"extracted package at {cacheDir} did not contain a Lz.Cli.dll under tools/<tfm>/any/.");
 
         return dllPath;
+    }
+
+    /// <summary>
+    /// Locate <c>Lz.Cli.dll</c> inside an extracted nupkg tree. Returns the
+    /// path under the highest-numbered <c>tools/&lt;tfm&gt;/any/</c> directory
+    /// (e.g. prefers net10.0 over net9.0). Returns null if not found.
+    /// </summary>
+    private static string? FindCliDll(string cacheDir)
+    {
+        var toolsDir = Path.Combine(cacheDir, "tools");
+        if (!Directory.Exists(toolsDir)) return null;
+
+        // Each tfm dir contains <rid>/Lz.Cli.dll (rid is usually "any" for
+        // managed-only tools). Walk all tfm dirs, pick newest by name.
+        string? best = null;
+        string? bestTfm = null;
+        foreach (var tfmDir in Directory.EnumerateDirectories(toolsDir))
+        {
+            var tfm = Path.GetFileName(tfmDir);
+            var candidate = Path.Combine(tfmDir, "any", "Lz.Cli.dll");
+            if (!File.Exists(candidate)) continue;
+
+            if (bestTfm == null || string.Compare(tfm, bestTfm, StringComparison.OrdinalIgnoreCase) > 0)
+            {
+                best = candidate;
+                bestTfm = tfm;
+            }
+        }
+        return best;
     }
 
     /// <summary>
@@ -368,8 +399,12 @@ internal static class Program
 
     /// <summary>
     /// Spawn <c>dotnet &lt;dll&gt; &lt;args&gt;</c>, forward stdio, return its exit code.
+    /// Sets <see cref="EnvRunnerVersion"/>, <see cref="EnvNupkgPath"/>, and
+    /// <see cref="EnvFeed"/> on the child process so Lz.Cli's <c>--version</c>
+    /// handler can render the 3-line output that names the runner + cli +
+    /// plugin separately.
     /// </summary>
-    private static int InvokeDll(string dllPath, string[] args)
+    private static int InvokeDll(string dllPath, string[] args, string nupkgPath, string feedDir)
     {
         var psi = new ProcessStartInfo
         {
@@ -382,25 +417,34 @@ internal static class Program
         psi.ArgumentList.Add(dllPath);
         foreach (var a in args) psi.ArgumentList.Add(a);
 
+        // Tell Lz.Cli who we are and where it came from. Lz.Cli's --version
+        // handler reads these; everything else ignores them.
+        psi.EnvironmentVariables[EnvRunnerVersion] = GetRunnerVersion();
+        psi.EnvironmentVariables[EnvNupkgPath]     = nupkgPath;
+        psi.EnvironmentVariables[EnvFeed]          = feedDir;
+
         using var proc = Process.Start(psi)
             ?? throw new LzRunnerException("failed to spawn dotnet — is it on PATH?");
         proc.WaitForExit();
         return proc.ExitCode;
     }
 
+    /// <summary>
+    /// Read this assembly's <see cref="AssemblyInformationalVersionAttribute"/>
+    /// (preferred — carries the +commit-hash MSBuild appends) or fall back to
+    /// <see cref="AssemblyName.Version"/>.
+    /// </summary>
+    private static string GetRunnerVersion()
+    {
+        var asm = typeof(Program).Assembly;
+        return asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? asm.GetName().Version?.ToString()
+            ?? "(unknown)";
+    }
+
     // -----------------------------------------------------------------------
     // Utilities
     // -----------------------------------------------------------------------
-
-    /// <summary>
-    /// Read a value baked into this assembly at build time via
-    /// <see cref="AssemblyMetadataAttribute"/>. Returns null if absent.
-    /// </summary>
-    private static string? GetAssemblyMetadata(string key) =>
-        typeof(Program).Assembly
-            .GetCustomAttributes<AssemblyMetadataAttribute>()
-            .FirstOrDefault(a => string.Equals(a.Key, key, StringComparison.Ordinal))
-            ?.Value;
 
     private static void Verbose(string message)
     {
