@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Text.Json;
 using System.Xml.Linq;
 
 namespace Lz.Runner;
@@ -10,8 +11,9 @@ namespace Lz.Runner;
 /// current directory and invokes it via <c>dotnet &lt;dll&gt;</c>. The rule is
 /// identical to what NuGet itself does at restore time: walk up for
 /// <c>NuGet.Config</c>, read its <c>&lt;packageSources&gt;</c>, scan every local
-/// source for the newest <c>Lz.Cli.*.nupkg</c>. Extract once into a per-version
-/// cache, then forward the process.
+/// source for the newest <c>Lz.Cli.*.nupkg</c>. Extract into a per-version
+/// cache validated against the resolved nupkg (see <see cref="EnsureExtracted"/>),
+/// then forward the process.
 ///
 /// If the resolved chain doesn't lead to a local feed containing an
 /// <c>Lz.Cli.*.nupkg</c>, the runner emits a clear error and exits non-zero.
@@ -311,9 +313,20 @@ internal static class Program
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Ensure the nupkg is extracted to the per-version cache, then return
-    /// the path to Lz.Cli.dll. Extraction is idempotent; subsequent calls
-    /// against the same version skip the unpack.
+    /// Ensure the RESOLVED nupkg is extracted to the per-version cache, then
+    /// return the path to Lz.Cli.dll.
+    ///
+    /// The cache is keyed by version, but a version string alone does not
+    /// identify content in this ecosystem: multiple working copies embed
+    /// their own Lz repo and pack under whatever LzVersion.props says, so
+    /// two systems (or one system re-packing) can emit DIFFERENT bits under
+    /// the SAME version. To keep the fast path honest, each cache entry
+    /// carries a <c>.source.json</c> marker recording the length + mtime of
+    /// the nupkg it was extracted from. A cache hit requires the marker to
+    /// match the nupkg the resolver just picked — otherwise the entry is
+    /// treated as stale (foreign working copy, same-version repack, or a
+    /// partial extraction that never wrote its marker) and rebuilt from the
+    /// resolved nupkg. Steady-state cost of the check is two stats.
     ///
     /// The Lz.Cli package layout is <c>tools/&lt;tfm&gt;/any/Lz.Cli.dll</c>
     /// where &lt;tfm&gt; is whatever TargetFramework Lz.Cli was packed for
@@ -328,22 +341,46 @@ internal static class Program
         var cacheRoot = GetCacheRoot();
         var cacheDir = Path.Combine(cacheRoot, version.ToString());
 
-        // Fast path: already extracted, just locate the dll.
+        // Fast path: already extracted FROM THIS EXACT NUPKG (marker match),
+        // and the dll is locatable.
         if (Directory.Exists(cacheDir))
         {
-            var cached = FindCliDll(cacheDir);
-            if (cached != null) return cached;
+            if (MarkerMatches(cacheDir, nupkgPath))
+            {
+                var cached = FindCliDll(cacheDir);
+                if (cached != null)
+                {
+                    Verbose($"cache hit: {cacheDir} matches resolved nupkg");
+                    return cached;
+                }
+                Verbose($"cache entry {cacheDir} has a valid marker but no Lz.Cli.dll; rebuilding");
+            }
+            else
+            {
+                Verbose($"cache entry {cacheDir} is stale or foreign (marker mismatch/missing); rebuilding from {nupkgPath}");
+            }
         }
 
-        Directory.CreateDirectory(cacheDir);
         try
         {
+            // Rebuild the entry from scratch so files from a previous
+            // extraction (different TFM dirs, removed dependencies) can't
+            // linger alongside the new payload.
+            if (Directory.Exists(cacheDir))
+                Directory.Delete(cacheDir, recursive: true);
+            Directory.CreateDirectory(cacheDir);
             ZipFile.ExtractToDirectory(nupkgPath, cacheDir, overwriteFiles: true);
+
+            // Marker last: it doubles as the "extraction completed" sentinel.
+            // A crash before this line leaves no marker, so the next run
+            // rebuilds rather than trusting a half-written entry.
+            WriteMarker(cacheDir, nupkgPath);
         }
         catch (Exception ex)
         {
             throw new LzRunnerException(
-                $"failed to extract {nupkgPath} into {cacheDir}: {ex.Message}");
+                $"failed to extract {nupkgPath} into {cacheDir}: {ex.Message}" + Environment.NewLine +
+                $"  If another lz process is running, retry; otherwise delete {cacheDir} and retry.");
         }
 
         var dllPath = FindCliDll(cacheDir);
@@ -352,6 +389,60 @@ internal static class Program
                 $"extracted package at {cacheDir} did not contain a Lz.Cli.dll under tools/<tfm>/any/.");
 
         return dllPath;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache-entry source marker
+    // -----------------------------------------------------------------------
+
+    /// <summary>Marker file written into each cache entry after a successful
+    /// extraction, recording which nupkg the entry came from.</summary>
+    private const string MarkerFileName = ".source.json";
+
+    /// <summary>
+    /// Identity of the nupkg a cache entry was extracted from. Length +
+    /// last-write time (UTC ticks) identify the bytes for all practical
+    /// purposes here: two different packs of the same version virtually never
+    /// collide on both, while a byte-identical copy of the same nupkg (which
+    /// legitimately may hit the cache) usually preserves them. NupkgPath is
+    /// recorded for diagnostics only and deliberately NOT compared — the same
+    /// feed reached via a different path should still count as a match.
+    /// </summary>
+    private sealed record SourceMarker(string NupkgPath, long Length, long LastWriteTimeUtcTicks);
+
+    private static bool MarkerMatches(string cacheDir, string nupkgPath)
+    {
+        try
+        {
+            var markerPath = Path.Combine(cacheDir, MarkerFileName);
+            if (!File.Exists(markerPath)) return false;
+
+            var marker = JsonSerializer.Deserialize<SourceMarker>(File.ReadAllText(markerPath));
+            if (marker == null) return false;
+
+            var nupkg = new FileInfo(nupkgPath);
+            return nupkg.Exists
+                && nupkg.Length == marker.Length
+                && nupkg.LastWriteTimeUtc.Ticks == marker.LastWriteTimeUtcTicks;
+        }
+        catch
+        {
+            // Unreadable/corrupt marker — treat as stale; the caller rebuilds.
+            return false;
+        }
+    }
+
+    private static void WriteMarker(string cacheDir, string nupkgPath)
+    {
+        var nupkg = new FileInfo(nupkgPath);
+        var marker = new SourceMarker(
+            Path.GetFullPath(nupkgPath),
+            nupkg.Length,
+            nupkg.LastWriteTimeUtc.Ticks);
+
+        File.WriteAllText(
+            Path.Combine(cacheDir, MarkerFileName),
+            JsonSerializer.Serialize(marker, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     /// <summary>
