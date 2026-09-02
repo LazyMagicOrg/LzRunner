@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Xml.Linq;
 
 namespace Lz.Runner;
@@ -11,9 +12,10 @@ namespace Lz.Runner;
 /// current directory and invokes it via <c>dotnet &lt;dll&gt;</c>. The rule is
 /// identical to what NuGet itself does at restore time: walk up for
 /// <c>NuGet.Config</c>, read its <c>&lt;packageSources&gt;</c>, scan every local
-/// source for the newest <c>Lz.Cli.*.nupkg</c>. Extract into a per-version
-/// cache validated against the resolved nupkg (see <see cref="EnsureExtracted"/>),
-/// then forward the process.
+/// source for the newest <c>Lz.Cli.*.nupkg</c>. Extract into a cache entry
+/// keyed by that nupkg's identity — version plus length plus mtime, so two
+/// working copies that both pack "0.11.1" never share an entry (see
+/// <see cref="EnsureExtracted"/>) — then forward the process.
 ///
 /// If the resolved chain doesn't lead to a local feed containing an
 /// <c>Lz.Cli.*.nupkg</c>, the runner emits a clear error and exits non-zero.
@@ -313,20 +315,40 @@ internal static class Program
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Ensure the RESOLVED nupkg is extracted to the per-version cache, then
-    /// return the path to Lz.Cli.dll.
+    /// Ensure the RESOLVED nupkg is extracted into the cache and return the
+    /// path to its Lz.Cli.dll.
     ///
-    /// The cache is keyed by version, but a version string alone does not
-    /// identify content in this ecosystem: multiple working copies embed
-    /// their own Lz repo and pack under whatever LzVersion.props says, so
-    /// two systems (or one system re-packing) can emit DIFFERENT bits under
-    /// the SAME version. To keep the fast path honest, each cache entry
-    /// carries a <c>.source.json</c> marker recording the length + mtime of
-    /// the nupkg it was extracted from. A cache hit requires the marker to
-    /// match the nupkg the resolver just picked — otherwise the entry is
-    /// treated as stale (foreign working copy, same-version repack, or a
-    /// partial extraction that never wrote its marker) and rebuilt from the
-    /// resolved nupkg. Steady-state cost of the check is two stats.
+    /// Cache entries are keyed by nupkg IDENTITY, not by version alone:
+    /// <c>&lt;cacheRoot&gt;/&lt;version&gt;+&lt;length&gt;-&lt;mtimeUtcTicks&gt;/</c>.
+    /// A version string does not identify content in this ecosystem —
+    /// multiple working copies embed their own Lz repo and pack under
+    /// whatever LzVersion.props says, so two systems (or one system
+    /// re-packing) emit DIFFERENT bits under the SAME version. Giving every
+    /// distinct nupkg its own entry means two working copies never share a
+    /// folder, and a published entry is never deleted or rewritten. (Runner
+    /// 1.2.0 kept one folder per version, <c>&lt;cacheRoot&gt;/&lt;version&gt;/</c>,
+    /// and rebuilt it in place whenever the marker mismatched — which, when
+    /// the mismatch came from another working copy, gutted the folder
+    /// underneath the lz process still running from it there. The new
+    /// entries sit BESIDE that folder, never inside it, so even a
+    /// rolled-back 1.2.0 runner cannot reach them. The only delete that
+    /// remains is in <see cref="RetireIncompleteEntry"/>, guarded so it
+    /// cannot do that.)
+    ///
+    /// Each entry carries a <c>.source.json</c> marker recording the nupkg
+    /// it was extracted from; it doubles as the "extraction completed"
+    /// sentinel, and a hit requires it to match the resolved nupkg.
+    /// Steady-state cost of the check is two stats.
+    ///
+    /// Extraction is atomic as far as other runners can see: the nupkg is
+    /// unpacked into a private sibling staging directory
+    /// (<c>&lt;identity&gt;.tmp-&lt;pid&gt;</c>), the marker is written
+    /// there, and the finished directory is renamed into place in one step,
+    /// so the final path is only ever absent or complete. Publishers of one
+    /// entry are serialised by a short-lived lock file
+    /// (<c>&lt;identity&gt;.lock</c>), so two runners racing to extract the
+    /// same nupkg both succeed — the second adopts the first one's entry
+    /// and discards its own staging copy.
     ///
     /// The Lz.Cli package layout is <c>tools/&lt;tfm&gt;/any/Lz.Cli.dll</c>
     /// where &lt;tfm&gt; is whatever TargetFramework Lz.Cli was packed for
@@ -338,57 +360,280 @@ internal static class Program
     /// </summary>
     private static string EnsureExtracted(string nupkgPath, Version version)
     {
+        var source = SourceMarker.Capture(nupkgPath);
         var cacheRoot = GetCacheRoot();
-        var cacheDir = Path.Combine(cacheRoot, version.ToString());
+        var cacheDir = Path.Combine(cacheRoot, $"{version}+{source.Identity}");
 
-        // Fast path: already extracted FROM THIS EXACT NUPKG (marker match),
-        // and the dll is locatable.
+        // Fast path: this exact nupkg is already extracted and complete.
+        if (TryUseEntry(cacheDir, source, out var cached))
+        {
+            Verbose($"cache hit: {cacheDir}");
+            return cached;
+        }
+        Verbose(Directory.Exists(cacheDir)
+            ? $"cache entry {cacheDir} is incomplete (marker missing/damaged or no Lz.Cli.dll); rebuilding from {nupkgPath}"
+            : $"no cache entry for {nupkgPath}; extracting into {cacheDir}");
+
+        Directory.CreateDirectory(cacheRoot);
+        SweepAbandonedEntries(cacheRoot);
+
+        var staging = ScratchName(cacheDir, StagingSuffix);
+        try
+        {
+            Directory.CreateDirectory(staging);
+            ZipFile.ExtractToDirectory(nupkgPath, staging, overwriteFiles: true);
+
+            // Validate BEFORE publishing: a package with no Lz.Cli.dll must
+            // never become an entry, or every later run would re-extract,
+            // retire and re-publish it.
+            if (FindCliDll(staging) == null)
+                throw new LzRunnerException(
+                    $"{nupkgPath} does not contain a Lz.Cli.dll under tools/<tfm>/any/; not caching it.");
+
+            // Marker last: it doubles as the "extraction completed" sentinel.
+            // A crash before this line leaves a marker-less staging dir that
+            // SweepAbandonedEntries removes on a later run.
+            WriteMarker(staging, source);
+        }
+        catch (LzRunnerException)
+        {
+            DeleteQuietly(staging);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            DeleteQuietly(staging);
+            throw new LzRunnerException(
+                $"failed to extract {nupkgPath} into {staging}: {ex.Message}");
+        }
+
+        return PublishEntry(staging, cacheDir, source);
+    }
+
+    /// <summary>
+    /// Move a fully extracted staging directory into its final place and
+    /// return the Lz.Cli.dll path. Runs under the entry's publish lock, so
+    /// "is a complete entry already here?" and "rename mine into place" are
+    /// one atomic step with respect to every other publisher of the same
+    /// entry. Handles the two ways the final path can already be occupied:
+    /// another runner finished the same entry first (adopt it, discard
+    /// ours), or a damaged entry is sitting there (retire it first — see
+    /// <see cref="RetireIncompleteEntry"/>).
+    /// </summary>
+    private static string PublishEntry(string staging, string cacheDir, SourceMarker source)
+    {
+        using var publishLock = AcquirePublishLock(cacheDir + LockSuffix, staging);
+
+        if (TryUseEntry(cacheDir, source, out var dll))
+        {
+            Verbose($"another lz process published {cacheDir} first; using it");
+            DeleteQuietly(staging);
+            return dll;
+        }
+
         if (Directory.Exists(cacheDir))
         {
-            if (MarkerMatches(cacheDir, nupkgPath))
+            try
             {
-                var cached = FindCliDll(cacheDir);
-                if (cached != null)
-                {
-                    Verbose($"cache hit: {cacheDir} matches resolved nupkg");
-                    return cached;
-                }
-                Verbose($"cache entry {cacheDir} has a valid marker but no Lz.Cli.dll; rebuilding");
+                RetireIncompleteEntry(cacheDir);
             }
-            else
+            catch
             {
-                Verbose($"cache entry {cacheDir} is stale or foreign (marker mismatch/missing); rebuilding from {nupkgPath}");
+                DeleteQuietly(staging);
+                throw;
             }
         }
 
         try
         {
-            // Rebuild the entry from scratch so files from a previous
-            // extraction (different TFM dirs, removed dependencies) can't
-            // linger alongside the new payload.
-            if (Directory.Exists(cacheDir))
-                Directory.Delete(cacheDir, recursive: true);
-            Directory.CreateDirectory(cacheDir);
-            ZipFile.ExtractToDirectory(nupkgPath, cacheDir, overwriteFiles: true);
+            MoveDirectoryWithRetry(staging, cacheDir);
+        }
+        catch (Exception ex)
+        {
+            DeleteQuietly(staging);
+            throw new LzRunnerException(
+                $"failed to move extracted package {staging} into place at {cacheDir}: {ex.Message}");
+        }
 
-            // Marker last: it doubles as the "extraction completed" sentinel.
-            // A crash before this line leaves no marker, so the next run
-            // rebuilds rather than trusting a half-written entry.
-            WriteMarker(cacheDir, nupkgPath);
+        return FindCliDll(cacheDir)
+            ?? throw new LzRunnerException(
+                $"extracted package at {cacheDir} did not contain a Lz.Cli.dll under tools/<tfm>/any/.");
+    }
+
+    /// <summary>True when <paramref name="cacheDir"/> exists, its marker
+    /// matches the nupkg identity this run resolved, and it contains an
+    /// Lz.Cli.dll (whose path is returned).</summary>
+    private static bool TryUseEntry(string cacheDir, SourceMarker source, out string dllPath)
+    {
+        dllPath = "";
+        if (!Directory.Exists(cacheDir) || !MarkerMatches(cacheDir, source)) return false;
+        var found = FindCliDll(cacheDir);
+        if (found == null) return false;
+        dllPath = found;
+        return true;
+    }
+
+    /// <summary>
+    /// This runner never leaves an incomplete entry at the final path: entries
+    /// are published only by renaming a finished staging directory into
+    /// place, under the publish lock. So an entry with no valid marker means
+    /// something outside the runner damaged it — a hand-deleted marker, a
+    /// disk problem, a foreign tool. Nothing should be running from it, but
+    /// that is not certain, and a recursive delete on Windows removes every
+    /// file it CAN before throwing on the first one it can't — which is
+    /// exactly how a live process gets gutted. So the entry is renamed aside
+    /// first: on Windows a rename is all-or-nothing and fails outright if any
+    /// file inside is open, so a live user of the entry turns this into a
+    /// clean error instead. (On Unix rename(2) succeeds regardless; a process
+    /// already running from the entry keeps its open files, and the path is
+    /// re-populated with identical bytes moments later.) Only after the
+    /// rename succeeds is the retired copy deleted.
+    /// </summary>
+    private static void RetireIncompleteEntry(string cacheDir)
+    {
+        var retired = ScratchName(cacheDir, RetiredSuffix);
+        try
+        {
+            MoveDirectoryWithRetry(cacheDir, retired);
         }
         catch (Exception ex)
         {
             throw new LzRunnerException(
-                $"failed to extract {nupkgPath} into {cacheDir}: {ex.Message}" + Environment.NewLine +
-                $"  If another lz process is running, retry; otherwise delete {cacheDir} and retry.");
+                $"cache entry {cacheDir} is incomplete but could not be moved aside: {ex.Message}" + Environment.NewLine +
+                $"  If an lz process is still running from it, wait for it to finish; otherwise delete {cacheDir} and retry.");
         }
+        Verbose($"retired incomplete cache entry {cacheDir}");
+        DeleteQuietly(retired);
+    }
 
-        var dllPath = FindCliDll(cacheDir);
-        if (dllPath == null)
-            throw new LzRunnerException(
-                $"extracted package at {cacheDir} did not contain a Lz.Cli.dll under tools/<tfm>/any/.");
+    private const string StagingSuffix = ".tmp-";
+    private const string RetiredSuffix = ".stale-";
+    private const string LockSuffix    = ".lock";
 
-        return dllPath;
+    /// <summary>
+    /// Name for a private scratch directory beside an entry:
+    /// <c>&lt;entry&gt;&lt;suffix&gt;&lt;pid&gt;-&lt;random&gt;</c>. The pid lets
+    /// <see cref="SweepAbandonedEntries"/> tell abandoned from live; the random
+    /// token means a reused pid can never collide with a dead process's
+    /// leftovers, and no two live runners can ever be writing the same name —
+    /// so nothing this runner creates is ever shared with, or swept from
+    /// under, another runner.
+    /// </summary>
+    private static string ScratchName(string cacheDir, string suffix) =>
+        $"{cacheDir}{suffix}{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..8]}";
+
+    /// <summary>
+    /// Take the publish lock for one cache entry: an exclusively opened,
+    /// delete-on-close file beside the entry. Publishing is a single rename,
+    /// so the lock is held for milliseconds; waiting is bounded so a wedged
+    /// holder cannot hang every later run. The OS releases the lock if the
+    /// holder dies. Extraction itself happens BEFORE the lock, in a private
+    /// staging directory, so runners never serialise on the slow part.
+    /// </summary>
+    private static FileStream AcquirePublishLock(string lockPath, string staging)
+    {
+        var deadline = Environment.TickCount64 + 30_000;
+        var reported = false;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                    FileShare.None, bufferSize: 1, FileOptions.DeleteOnClose);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (Environment.TickCount64 >= deadline)
+                {
+                    DeleteQuietly(staging);
+                    throw new LzRunnerException(
+                        $"timed out waiting for another lz process to finish publishing {Path.GetDirectoryName(lockPath)}: {ex.Message}" + Environment.NewLine +
+                        $"  If no lz process is running, delete {lockPath} and retry.");
+                }
+                if (!reported) { Verbose($"waiting for another lz process to finish publishing ({lockPath})"); reported = true; }
+                Thread.Sleep(100);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Rename a directory, retrying for a couple of seconds. Windows refuses
+    /// to rename a directory while any file beneath it is open, and real-time
+    /// antivirus and the search indexer briefly open freshly written files —
+    /// so the very first rename after an extraction can fail for no lasting
+    /// reason. (The .NET SDK's own tool installer retries its staging → final
+    /// rename for the same reason.) A rename whose target already exists is
+    /// not transient and is reported at once.
+    /// </summary>
+    private static void MoveDirectoryWithRetry(string from, string to)
+    {
+        const int maxAttempts = 25;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Directory.Move(from, to);
+                return;
+            }
+            catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException)
+                                       && attempt < maxAttempts && !Directory.Exists(to))
+            {
+                if (attempt == 1) Verbose($"rename of {Path.GetFileName(from)} failed ({ex.Message.TrimEnd('.')}); retrying");
+                Thread.Sleep(100);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Best-effort removal of staging / retired directories left behind by
+    /// runners that died part-way (their pid is in the directory name and
+    /// is no longer running). Never touches a directory whose owner is
+    /// alive or whose liveness can't be determined, and — because every
+    /// scratch name also carries a random token — never one that a live
+    /// runner could be about to create. Runs only on the slow path, so the
+    /// cache-hit cost stays at two stats.
+    /// </summary>
+    private static void SweepAbandonedEntries(string cacheRoot)
+    {
+        if (!Directory.Exists(cacheRoot)) return;
+        foreach (var suffix in new[] { StagingSuffix, RetiredSuffix })
+        {
+            foreach (var dir in Directory.EnumerateDirectories(cacheRoot, $"*{suffix}*"))
+            {
+                var name = Path.GetFileName(dir);
+                var at = name.LastIndexOf(suffix, StringComparison.Ordinal);
+                if (at < 0) continue;
+                var rest = name.AsSpan(at + suffix.Length);          // "<pid>-<random>"
+                var dash = rest.IndexOf('-');
+                if (dash < 0 || !int.TryParse(rest[..dash], out var pid)) continue;
+                if (pid == Environment.ProcessId || ProcessAlive(pid)) continue;
+                Verbose($"removing abandoned cache directory {dir} (pid {pid} is gone)");
+                DeleteQuietly(dir);
+            }
+        }
+    }
+
+    private static bool ProcessAlive(int pid)
+    {
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch (ArgumentException) { return false; } // no such process
+        catch { return true; }                      // can't tell — leave it alone
+    }
+
+    private static void DeleteQuietly(string dir)
+    {
+        try
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            Verbose($"could not remove {dir}: {ex.Message}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -404,13 +649,42 @@ internal static class Program
     /// last-write time (UTC ticks) identify the bytes for all practical
     /// purposes here: two different packs of the same version virtually never
     /// collide on both, while a byte-identical copy of the same nupkg (which
-    /// legitimately may hit the cache) usually preserves them. NupkgPath is
-    /// recorded for diagnostics only and deliberately NOT compared — the same
-    /// feed reached via a different path should still count as a match.
+    /// legitimately may hit the cache) usually preserves them. The same pair
+    /// names the entry's directory (<see cref="Identity"/>), so a foreign
+    /// working copy's build or a same-version repack lands in its own
+    /// directory instead of displacing this one. NupkgPath is recorded for
+    /// diagnostics only and deliberately NOT compared — the same feed
+    /// reached via a different path should still count as a match.
     /// </summary>
-    private sealed record SourceMarker(string NupkgPath, long Length, long LastWriteTimeUtcTicks);
+    private sealed record SourceMarker(string NupkgPath, long Length, long LastWriteTimeUtcTicks)
+    {
+        /// <summary>Snapshot the resolved nupkg's identity once, so the
+        /// directory name and the marker written into it always agree even
+        /// if the nupkg is repacked while this run is in flight.</summary>
+        public static SourceMarker Capture(string nupkgPath)
+        {
+            var nupkg = new FileInfo(nupkgPath);
+            if (!nupkg.Exists)
+                throw new LzRunnerException($"resolved nupkg no longer exists: {nupkgPath}");
+            return new SourceMarker(Path.GetFullPath(nupkgPath), nupkg.Length, nupkg.LastWriteTimeUtc.Ticks);
+        }
 
-    private static bool MarkerMatches(string cacheDir, string nupkgPath)
+        /// <summary>Directory name of this nupkg's cache entry under the
+        /// version directory.</summary>
+        [JsonIgnore]
+        public string Identity => $"{Length}-{LastWriteTimeUtcTicks}";
+    }
+
+    /// <summary>
+    /// Does the entry's marker record the identity this run resolved? The
+    /// comparison is against the identity captured once at the start of the
+    /// run — NOT a fresh stat of the nupkg — so an entry is judged purely on
+    /// being complete and self-consistent. A nupkg repacked while this run is
+    /// in flight can therefore neither invalidate the entry it is using nor
+    /// send a complete entry down the retire path; the next run simply
+    /// resolves to a new identity and a new entry.
+    /// </summary>
+    private static bool MarkerMatches(string cacheDir, SourceMarker source)
     {
         try
         {
@@ -418,28 +692,19 @@ internal static class Program
             if (!File.Exists(markerPath)) return false;
 
             var marker = JsonSerializer.Deserialize<SourceMarker>(File.ReadAllText(markerPath));
-            if (marker == null) return false;
-
-            var nupkg = new FileInfo(nupkgPath);
-            return nupkg.Exists
-                && nupkg.Length == marker.Length
-                && nupkg.LastWriteTimeUtc.Ticks == marker.LastWriteTimeUtcTicks;
+            return marker != null
+                && marker.Length == source.Length
+                && marker.LastWriteTimeUtcTicks == source.LastWriteTimeUtcTicks;
         }
         catch
         {
-            // Unreadable/corrupt marker — treat as stale; the caller rebuilds.
+            // Unreadable/corrupt marker — treat as damaged; the caller rebuilds.
             return false;
         }
     }
 
-    private static void WriteMarker(string cacheDir, string nupkgPath)
+    private static void WriteMarker(string cacheDir, SourceMarker marker)
     {
-        var nupkg = new FileInfo(nupkgPath);
-        var marker = new SourceMarker(
-            Path.GetFullPath(nupkgPath),
-            nupkg.Length,
-            nupkg.LastWriteTimeUtc.Ticks);
-
         File.WriteAllText(
             Path.Combine(cacheDir, MarkerFileName),
             JsonSerializer.Serialize(marker, new JsonSerializerOptions { WriteIndented = true }));
@@ -475,8 +740,16 @@ internal static class Program
     }
 
     /// <summary>
-    /// Cache location — <c>%LOCALAPPDATA%\lz-runner\cache</c> on Windows,
-    /// <c>$XDG_CACHE_HOME/lz-runner</c> on Unix, with sensible fallbacks.
+    /// Cache location: <c>LocalApplicationData</c> + <c>lz-runner/cache</c> —
+    /// <c>%LOCALAPPDATA%\lz-runner\cache</c> on Windows,
+    /// <c>$XDG_DATA_HOME/lz-runner/cache</c> (default
+    /// <c>~/.local/share/lz-runner/cache</c>) on Linux,
+    /// <c>~/Library/Application Support/lz-runner/cache</c> on macOS — falling
+    /// back to <c>~/.lz-runner/cache</c> if that folder cannot be resolved.
+    /// Layout beneath it is <c>&lt;version&gt;+&lt;length&gt;-&lt;mtimeUtcTicks&gt;/</c>
+    /// per extracted nupkg (see <see cref="EnsureExtracted"/>). Runner 1.2.0
+    /// and earlier extracted into <c>&lt;version&gt;/</c>; those directories
+    /// are left untouched and are inert.
     /// </summary>
     private static string GetCacheRoot()
     {

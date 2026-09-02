@@ -2,14 +2,18 @@
   <PropertyGroup>
     <!--
       Version of the Lz.Runner dispatcher, NOT of the Lz infrastructure
-      logic it dispatches to. Bump this only when the resolver algorithm,
-      the entry-point contract with Lz.Cli, or the env-var protocol
-      changes — i.e. very rarely.
+      logic it dispatches to. Bump it for ANY change in the runner's
+      observable behaviour — resolution, the extraction cache layout or
+      its rules, the entry-point contract with Lz.Cli, or the env-var
+      protocol. `dotnet tool update` keys on this number, and a same-version
+      repack is served unchanged from the NuGet global-packages cache, so a
+      behaviour change without a bump never reaches an installed machine.
+      (Every bump so far — 1.1.0, 1.2.0, 1.3.0 — was a cache change.)
 
       The infrastructure logic (Lz.Cli + Lz.Aws + Lz.Azure + Lz.Core +
       Lz.Gen) has its own LzVersion.props in the Lz repo and moves on
       its own cadence.
     -->
-    <LzRunnerVersion>1.2.0</LzRunnerVersion>
+    <LzRunnerVersion>1.3.0</LzRunnerVersion>
   </PropertyGroup>
 </Project>

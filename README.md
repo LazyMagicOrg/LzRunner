@@ -14,12 +14,56 @@ architecture writeup.
 ## Install
 
 ```
-dotnet tool install -g Lz.Runner --version 1.0.0 \
+dotnet tool install -g Lz.Runner \
   --add-source <path-to-this-repo/Packages>
 ```
 
-(Or `--add-source` pointing at a published feed once `Lz.Runner.1.0.0`
-is there.)
+(Or `--add-source` pointing at a published feed once the package is
+there.) To move an existing install to a newer build, use
+`dotnet tool update -g Lz.Runner --add-source <path-to-this-repo/Packages>`
+while no `lz` process is running.
+
+## Extraction cache
+
+The resolved nupkg is unpacked once and reused. Location:
+`%LOCALAPPDATA%\lz-runner\cache` on Windows, `~/.local/share/lz-runner/cache`
+(`$XDG_DATA_HOME`) on Linux, `~/Library/Application Support/lz-runner/cache`
+on macOS. `LZ_RUNNER_VERBOSE=1` prints the exact entry in use. Layout:
+
+```
+cache/
+├── 0.11.1/                                  runner ≤1.2.0 layout — inert leftovers
+└── 0.11.1+82752768-639239760291128396/      <version>+<length>-<mtimeUtcTicks>: one entry per distinct nupkg
+    ├── .source.json                         which nupkg it came from; "complete" sentinel
+    └── tools/<tfm>/any/Lz.Cli.dll
+```
+
+Entries are keyed by the nupkg's **identity** (version + length + mtime),
+not by version alone. Several working copies on one machine routinely
+pack different bits under the same `LzVersion`, and each one gets its own
+entry, so switching between working copies never rebuilds or deletes
+anything, and an `lz` run in one working copy can never disturb an `lz`
+run in another. (Runner 1.2.0 kept a single folder per version and
+rebuilt it in place on a mismatch; that rebuild deleted the folder out
+from under whatever `lz` process the *other* working copy still had
+running from it.)
+
+Extraction goes into a private staging directory
+(`<identity>.tmp-<pid>`) that is renamed into place only when complete,
+so an entry is either whole or absent. The rename is retried for a couple
+of seconds because Windows antivirus and indexing briefly hold freshly
+written files. Publishers of one entry take a short-lived lock file
+(`<identity>.lock`) around the rename, so two `lz` processes racing to
+extract the same nupkg both succeed. Staging or retired directories left
+by a runner that died part-way are swept up by a later run once their
+pid is gone.
+
+Nothing is ever pruned automatically; the cache only grows by one
+extracted tree (~280 MB for Lz.Cli) per distinct nupkg. Delete the whole
+`cache` directory at any quiet moment (no `lz` running) to reclaim
+space. The `<version>/` directories that runner 1.2.0 extracted into are
+inert leftovers; 1.3.0 entries sit beside them, never inside, so even a
+rolled-back 1.2.0 runner rebuilding its folder cannot disturb them.
 
 ## Entry-point contract with Lz.Cli
 

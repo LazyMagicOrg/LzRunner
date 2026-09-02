@@ -12,8 +12,9 @@
     <!-- Global tool packaging. Owns the `lz` command. When installed, it
          loads the highest-versioned Lz.Cli.*.nupkg it can find via the
          NuGet.Config walk for the current directory, extracts it to
-         %LOCALAPPDATA%\lz-runner\cache\<version>\, and invokes
-         `dotnet <extracted-Lz.Cli.dll> <args>`. -->
+         %LOCALAPPDATA%\lz-runner\cache\<version>+<length>-<mtime>\ (one
+         entry per distinct nupkg, so working copies never share one), and
+         invokes `dotnet <extracted-Lz.Cli.dll> <args>`. -->
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>lz</ToolCommandName>
     <PackageId>Lz.Runner</PackageId>
