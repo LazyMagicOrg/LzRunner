@@ -20,6 +20,18 @@
     <PackageId>Lz.Runner</PackageId>
     <Version>$(LzRunnerVersion)</Version>
     <Description>Lz dispatcher — resolves the correct Lz.Cli version from the in-scope NuGet.Config and invokes it. Installs as `lz`.</Description>
+
+    <!-- MIT, matching the sibling LazyMagic repo. The full text is LICENSE.txt at
+         the repo root, which is what GitHub reads; the SPDX expression here is what
+         puts a license on the package itself. Use the expression rather than
+         PackageLicenseFile: the two are mutually exclusive, and for a stock license
+         the identifier is what NuGet recommends. -->
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) 2026 Insight Sciences Corporation</Copyright>
+    <Authors>Tim May, Thomas May</Authors>
+    <Company>Insight Sciences Corporation</Company>
+    <RepositoryUrl>https://github.com/LazyMagicOrg/LzRunner</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <!-- No AssemblyMetadata for BuildOriginPackages or DefaultCliVersion.
