@@ -31,7 +31,9 @@ orders them (NuGet.Versioning, SemVer 2): `0.11.1 < 0.11.2-alpha.1 <
 0.11.2-alpha.2 < 0.11.2-beta.1 < 0.11.2`, numeric prerelease identifiers
 compare numerically (`alpha.10` beats `alpha.9`), and build metadata
 (`+g1a2b3c`) never affects the order. A tie on version keeps the first feed
-in NuGet.Config precedence order. This is what a `*-*` float would resolve
+enumerated, and feeds are enumerated in the order the config chain is walked
+(machine, user, then drive root down to cwd), so the OUTERMOST config's feed
+wins a tie - the same feed runner 1.3.0 chose. This is what a `*-*` float would resolve
 to, and it is what a developer building the framework locally wants:
 their own newest package wins, prerelease or not.
 
@@ -106,7 +108,20 @@ local feeds tried, and which one provided the resolved `Lz.Cli.*.nupkg`.
 
 ```
 dotnet build LzRunner.slnx -c Release
+dotnet test  LzRunner.slnx
 ```
 
-`CommonPackageHandling.targets` auto-publishes the resulting nupkg into
-`Packages/` on every build.
+`CommonPackageHandling.targets` publishes the resulting nupkg into
+`Packages/` on every **Release** build; Debug builds (including `dotnet test`)
+leave the shipped package alone. Always build and test through the `.slnx`:
+`Lz.Runner.csproj` imports the targets via `$(SolutionDir)`, which a
+project-level command does not set (`MSB4019`). To install what you built:
+
+```
+dotnet tool update -g Lz.Runner --add-source .\Packages
+```
+
+from this folder (a workspace root that uses package-source mapping refuses
+`--add-source`). If the same version was installed before, evict
+`%USERPROFILE%\.nuget\packages\lz.runner\<version>` first - a same-version
+repack is otherwise served unchanged from that cache.

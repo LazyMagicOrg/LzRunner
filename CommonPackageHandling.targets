@@ -10,7 +10,10 @@
 	<PropertyGroup>
 		<PackageRepoFolder>$(SolutionDir)Packages</PackageRepoFolder>
 		<Version>$(LzRunnerVersion)</Version>
-		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+		<!-- Pack and publish to Packages/ from RELEASE builds only. The runner is a distributed
+		     tool; a `dotnet test LzRunner.slnx` (Debug) used to overwrite the shipped nupkg with a
+		     Debug build stamped with whatever commit the tree happened to be at. -->
+		<GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">true</GeneratePackageOnBuild>
 		<IncludeSymbols>true</IncludeSymbols>
 		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
 	</PropertyGroup>
@@ -21,7 +24,7 @@
 	</Target>
 
 	<!-- Copy Package to local feed -->
-	<Target Name="CopyPackage" AfterTargets="Pack">
+	<Target Name="CopyPackage" AfterTargets="Pack" Condition="'$(Configuration)' == 'Release'">
 		<Message Importance="high" Text="Copying $(AssemblyName).$(Version).nupkg to Packages folder" />
 		<MakeDir Directories="$(PackageRepoFolder)" />
 		<Copy SourceFiles=".\bin\$(Configuration)\$(AssemblyName).$(Version).nupkg"

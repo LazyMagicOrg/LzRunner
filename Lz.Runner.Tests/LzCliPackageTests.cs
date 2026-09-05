@@ -87,11 +87,37 @@ public class LzCliPackageTests
     }
 
     [Fact]
+    public void TheDecidedLabelsOrderOrdinally_AndLocalOutranksAlphaAndBeta()
+    {
+        // SdlcVersioning section 7 chose the labels alpha (automatic), beta and rc (by tag) and
+        // local (never published). NuGet compares non-numeric identifiers ordinally, so the order
+        // is alpha < beta < local < rc < release - a developer's own local build outranks any
+        // alpha or beta of the same base version in a feed and loses only to rc and the release.
+        // That is the intended local-lane behaviour; pinned here so nobody assumes 'local' sorts
+        // below alpha (it does not, and neither does 'dev').
+        var pick = LzCliPackage.PickNewest(new[]
+        {
+            ("alpha", "Lz.Cli.0.11.2-alpha.40.nupkg"),
+            ("beta", "Lz.Cli.0.11.2-beta.3.nupkg"),
+            ("local", "Lz.Cli.0.11.2-local.g1a2b3c-dirty.nupkg"),
+        });
+        Assert.Equal("local", pick!.Value.Item);
+
+        pick = LzCliPackage.PickNewest(new[]
+        {
+            ("local", "Lz.Cli.0.11.2-local.g1a2b3c.nupkg"),
+            ("rc", "Lz.Cli.0.11.2-rc.1.nupkg"),
+        });
+        Assert.Equal("rc", pick!.Value.Item);
+    }
+
+    [Fact]
     public void BuildMetadataNeverAffectsTheOrder_SoATieKeepsTheFirstFeed()
     {
         // Two feeds can hold the same version packed from different commits. Metadata is not
         // precedence (SemVer 2), so this is a tie, and a tie keeps the FIRST candidate — feeds
-        // arrive in NuGet.Config precedence order, exactly the feed runner 1.3.0 chose.
+        // arrive in the order the config chain is walked (machine, user, then root-to-cwd), so
+        // the OUTERMOST config's feed wins a tie, exactly as runner 1.3.0 behaved.
         var pick = LzCliPackage.PickNewest(new[]
         {
             ("first", "Lz.Cli.0.11.1+gaaaaaaa.nupkg"),
