@@ -23,6 +23,24 @@ there.) To move an existing install to a newer build, use
 `dotnet tool update -g Lz.Runner --add-source <path-to-this-repo/Packages>`
 while no `lz` process is running.
 
+## Resolution
+
+Across every local feed in scope the runner picks the **highest-versioned**
+`Lz.Cli.<version>.nupkg`, with versions parsed and ordered the way NuGet
+orders them (NuGet.Versioning, SemVer 2): `0.11.1 < 0.11.2-alpha.1 <
+0.11.2-alpha.2 < 0.11.2-beta.1 < 0.11.2`, numeric prerelease identifiers
+compare numerically (`alpha.10` beats `alpha.9`), and build metadata
+(`+g1a2b3c`) never affects the order. A tie on version keeps the first feed
+in NuGet.Config precedence order. This is what a `*-*` float would resolve
+to, and it is what a developer building the framework locally wants:
+their own newest package wins, prerelease or not.
+
+Runner 1.3.0 and earlier filtered candidates with `System.Version`, which
+rejects anything carrying a prerelease label — so a feed holding only
+derived versions resolved to nothing and `lz` failed in every workspace on
+the machine at once. Fixed in 1.4.0. Remote sources are still ignored by
+design; registry resolution is a separate, undecided piece of work.
+
 ## Extraction cache
 
 The resolved nupkg is unpacked once and reused. Location:
@@ -38,7 +56,8 @@ cache/
     └── tools/<tfm>/any/Lz.Cli.dll
 ```
 
-Entries are keyed by the nupkg's **identity** (version + length + mtime),
+Entries are keyed by the nupkg's **identity** (normalized version + length + mtime;
+the normalized version drops build metadata, so it never contains the `+` separator),
 not by version alone. Several working copies on one machine routinely
 pack different bits under the same `LzVersion`, and each one gets its own
 entry, so switching between working copies never rebuilds or deletes

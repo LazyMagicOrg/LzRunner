@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Xml.Linq;
+using NuGet.Versioning;
 
 namespace Lz.Runner;
 
@@ -47,7 +48,7 @@ internal static class Program
         try
         {
             var (nupkgPath, feedDescription, feedDir, cliVersion) = ResolveCliPackage();
-            Verbose($"resolved {cliVersion} from {feedDescription}");
+            Verbose($"resolved {cliVersion.ToFullString()} from {feedDescription}");
             var dllPath = EnsureExtracted(nupkgPath, cliVersion);
             return InvokeDll(dllPath, args, nupkgPath, feedDir);
         }
@@ -84,7 +85,7 @@ internal static class Program
     /// <see cref="LzRunnerException"/> with a clear message — there is no
     /// baked-in fallback (intentional; see class doc).
     /// </summary>
-    private static (string NupkgPath, string FeedDescription, string FeedDir, Version CliVersion) ResolveCliPackage()
+    private static (string NupkgPath, string FeedDescription, string FeedDir, NuGetVersion CliVersion) ResolveCliPackage()
     {
         var (configs, localFeeds) = ResolveEffectiveLocalFeeds(Directory.GetCurrentDirectory());
 
@@ -286,28 +287,20 @@ internal static class Program
     /// <summary>
     /// Across the given feeds, find the highest-versioned Lz.Cli.*.nupkg and
     /// return its path + feed + version. Returns null if no feed has one.
+    ///
+    /// Only the enumeration lives here; parsing and ordering are
+    /// <see cref="LzCliPackage"/>, which is why prereleases resolve (runner
+    /// 1.4.0 — 1.3.0 used System.Version and skipped them). Feeds are visited
+    /// in the order given, and a tie on version keeps the first.
     /// </summary>
-    private static (string Path, string Feed, Version Version)? PickNewestLzCliAcross(IEnumerable<string> feeds)
+    internal static (string Path, string Feed, NuGetVersion Version)? PickNewestLzCliAcross(IEnumerable<string> feeds)
     {
-        (string Path, string Feed, Version Version)? best = null;
-        foreach (var feed in feeds)
-        {
-            foreach (var file in Directory.EnumerateFiles(feed, "Lz.Cli.*.nupkg"))
-            {
-                var name = Path.GetFileName(file);
-                // Matches Lz.Cli.<version>.nupkg (no extra dots after the version)
-                const string prefix = "Lz.Cli.";
-                const string suffix = ".nupkg";
-                if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
-                if (!name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) continue;
-                var verStr = name.Substring(prefix.Length, name.Length - prefix.Length - suffix.Length);
-                if (!Version.TryParse(verStr, out var v)) continue;
+        var candidates = feeds.SelectMany(feed =>
+            Directory.EnumerateFiles(feed, "Lz.Cli.*.nupkg")
+                .Select(file => ((Path: file, Feed: feed), Path.GetFileName(file))));
 
-                if (best == null || v > best.Value.Version)
-                    best = (file, feed, v);
-            }
-        }
-        return best;
+        var pick = LzCliPackage.PickNewest(candidates);
+        return pick is null ? null : (pick.Value.Item.Path, pick.Value.Item.Feed, pick.Value.Version);
     }
 
     // -----------------------------------------------------------------------
@@ -358,11 +351,13 @@ internal static class Program
     /// highest-numbered TFM directory when more than one exists (which
     /// shouldn't happen for a tool package, but defensive).
     /// </summary>
-    private static string EnsureExtracted(string nupkgPath, Version version)
+    private static string EnsureExtracted(string nupkgPath, NuGetVersion version)
     {
         var source = SourceMarker.Capture(nupkgPath);
         var cacheRoot = GetCacheRoot();
-        var cacheDir = Path.Combine(cacheRoot, $"{version}+{source.Identity}");
+        // The version half of the key is NuGet's normalized string (no build metadata), so it
+        // never contains the '+' that separates it from the identity — see LzCliPackage.CacheKey.
+        var cacheDir = Path.Combine(cacheRoot, $"{LzCliPackage.CacheKey(version)}+{source.Identity}");
 
         // Fast path: this exact nupkg is already extracted and complete.
         if (TryUseEntry(cacheDir, source, out var cached))

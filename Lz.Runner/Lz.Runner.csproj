@@ -34,6 +34,14 @@
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Versions are parsed and ordered the way NuGet does it — SemVer 2 with prerelease labels
+         and build metadata — so a feed holding derived prereleases resolves. System.Version,
+         which 1.3.0 used, rejects every prerelease (see LzCliPackage). -->
+    <PackageReference Include="NuGet.Versioning" Version="7.9.0" />
+    <InternalsVisibleTo Include="Lz.Runner.Tests" />
+  </ItemGroup>
+
   <!-- No AssemblyMetadata for BuildOriginPackages or DefaultCliVersion.
        After the LzRunner/Lz repo split, the runner has no inherent
        knowledge of where Lz.Cli lives or what version exists. If the
